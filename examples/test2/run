@@ -1,0 +1,68 @@
+#!/bin/sh
+#
+# This file is in public domain.
+#
+# Author: Ids van der Molen <ids@idsvandermolen.com>
+#
+# Script should accept "stop" and "start" parameters
+#
+# After start, the script should return when pidfile is created
+# After stop, pidfile should be removed
+set -e
+
+log_file=$(dirname $0)/run.log
+pid_file=$(dirname $0)/run.pid
+
+usage () {
+  echo "usage: $0 {start|stop}"
+  exit 1
+}
+
+if [ $# != 1 ]
+then
+  usage
+fi
+case "$1" in
+  'start')
+    if [ -f $pid_file ]
+    then
+      if [ -d /proc/$(cat $pid_file) ]
+      then
+        # already running
+        exit 0
+      else
+        # dead, but pid file exists
+        rm -f $pid_file
+      fi
+    fi
+    nohup sleep 60 &> $log_file < /dev/null &
+    echo $! > $pid_file
+  ;;
+  'stop')
+    if [ -f $pid_file ]
+    then
+      pid=$(cat $pid_file)
+      if [ -d /proc/$pid ]
+      then
+        kill $pid &> /dev/null
+        # wait max 30 seconds for it to terminate
+        for i in `seq 30`
+        do
+          [ ! -d /proc/$pid ] && break
+          sleep 1
+        done
+        if [ -d /proc/$pid ]
+        then
+          # still running, kill it
+          kill -KILL $pid &> /dev/null
+        fi
+      fi
+      rm -f $pid_file
+    fi
+  ;;
+  *)
+    usage
+  ;;
+esac
+
+exit 0

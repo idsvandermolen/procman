@@ -1,0 +1,597 @@
+#!/usr/bin/python
+'''
+This file is in public domain.
+
+Author: Ids van der Molen <ids@idsvandermolen.com>
+
+Manage processes by using profile directories and pid files. Dependencies are
+created by ordering the profile names. Profiles are started in lexicographical
+order and are stopped in reverse order.
+'''
+import sys
+import os
+import stat
+import time
+import logging
+import errno
+import subprocess
+import signal
+import resource
+import atexit
+from optparse import OptionParser
+
+GRANULARITY=1
+COMMAND_TIMEOUT=30 # commands may run for 30 seconds
+KILLAFTER=5 # time in seconds between TERM and KILL
+UMASK=0027
+KILL_WHEN_DISAPPREARED=True
+DISABLE_TIMEFRAME=60 # disable profile for 60 seconds
+
+class Error(Exception):
+  pass
+
+def parse_options(argv):
+  'Parse commandline.'
+  description = 'Manage processes using profiles'
+  usage = 'usage: %prog [options] <profiles dir> <pid file>'
+  parser = OptionParser(usage, description=description)
+  parser.add_option('-v','--verbose', help='verbose output', dest='verbose', action='store_true', default=False)
+  parser.add_option('-g','--debug', help='debug output', dest='debug', action='store_true', default=False)
+  parser.add_option('-d','--daemon', help='daemonize', dest='daemonize', action='store_true', default=False)
+  parser.add_option('-s','--start', help='start managed processes', dest='start', action='store_true', default=False)
+  parser.add_option('-e','--stop', help='stop managed processes', dest='stop', action='store_true', default=False)
+  parser.add_option('-t','--terminate', help='terminate daemon', dest='terminate', action='store_true', default=False)
+  parser.add_option('-r','--reopen', help='reopen logfile', dest='hangup', action='store_true', default=False)
+  parser.add_option('-q','--quiet', help='silently exit if already running', dest='quiet', action='store_true', default=False)
+  parser.add_option('-l','--log', help='log to FILE', dest='log_file', metavar='FILE')
+  (options, args) = parser.parse_args(args=argv[1:])
+
+  argc = len(args)
+  if argc != 2:
+    parser.print_help()
+    sys.exit(1)
+
+  if options.log_file:
+    options.log_file = os.path.abspath(options.log_file)
+
+  return options, args[0], args[1]
+
+def make_logger(options, stream=sys.stdout):
+  'Setup logging with OptionParser options object and return root logger object.'
+  log_level = logging.WARNING
+  if options.verbose:
+    log_level = logging.INFO
+  if options.debug:
+    log_level = logging.DEBUG
+  logging.basicConfig(format='%(asctime)s %(levelname)s %(name)s: %(message)s',
+                      stream=stream, level=log_level)
+  return logging.getLogger()
+
+def get_stat(path):
+  'Return path stat for checking if something changed.'
+  st = os.stat(path)
+  return (st[stat.ST_INO], st[stat.ST_DEV], st[stat.ST_MTIME])
+
+def read_file(filename):
+  'Try to read data from file.'
+  try:
+    f = file(filename)
+    s = f.read()
+    f.close()
+    return s
+  except (IOError, OSError), e:
+    raise Error('could not read file %s (%s)' % (filename, e))
+
+def read_pid_file(pid_file):
+  'Try to read pid from file.'
+  try:
+    return int(read_file(pid_file))
+  except ValueError, e:
+    raise Error('invalid pid file %s' % pid_file)
+  
+def pid_is_running(pid):
+  'Test if a process with pid is running.'
+  try:
+    os.kill(pid, 0)
+  except OSError, e:
+    if e.errno == errno.EPERM:
+      raise Error('could not test status of pid %d (Permission denied)' % pid) 
+    if e.errno == errno.ESRCH:
+      return False # No such process
+    raise Error('could not test status of pid %d (%s)' % (pid, e))
+    return False
+  return True
+    
+def write_pid(pid_file):
+  'Write pid of current process to file.'
+  try:
+    f = file(pid_file, 'w')
+    f.write(str(os.getpid()))
+    f.close()
+  except (IOError, OSError), e:
+    raise Error('could not write pid to file %s (%s)' % (pid_file, e))
+
+def redirect_input(stdin='/dev/null'):
+  'Redirect stdin to specified file.'
+  try:
+    si = file(stdin, 'r')
+  except IOError, e:
+    raise Error('could not open stdin file %s (%s)' % (stdin, e))
+  os.dup2(si.fileno(), sys.stdin.fileno())
+
+def redirect_output(stdout='/dev/null', stderr='/dev/null'):
+  'Redirect stdout and stderr to specified files.'
+  try:
+    so = file(stdout, 'a+', 1)
+  except IOError, e:
+    raise Error('could not open file %s (%s)' % (stdout, e))
+  sys.stdout.flush()
+  os.dup2(so.fileno(), sys.stdout.fileno())
+
+  try:
+    se = file(stderr, 'a+', 1)
+  except IOError, e:
+    raise Error('could not open file %s (%s)' % (stderr, e))
+  sys.stderr.flush()
+  os.dup2(se.fileno(), sys.stderr.fileno())
+
+def daemonize():
+  'Fork current process into a daemon.'
+  # Do first fork.
+  try:
+    pid = os.fork()
+    if pid != 0:
+      # Exit first parent.
+      os._exit(0)
+  except OSError, e:
+    Error('fork #1 failed (%s)' % e)
+
+  # Decouple from parent environment.
+  os.chdir('/')
+  os.setsid()
+  os.umask(UMASK)
+
+  # Do second fork.
+  try:
+    pid = os.fork()
+    if pid != 0:
+      # exit from second parent
+      os._exit(0)
+  except OSError, e:
+    Error('fork #2 failed (%s)' % e)
+
+  # close other open files, but keep stdin, stdout, stderr:
+  for fd in range(3, resource.getrlimit(resource.RLIMIT_NOFILE)[0]):
+    try:
+      os.close(fd)
+    except OSError, e:
+      pass
+  
+def switch_group(gid):
+  'Try to switch to group with gid.'
+  try:
+    os.setgid(gid)
+  except OSError, e:
+    raise Error('could not switch to gid %d (%s)' % (gid, e))
+  if gid != os.getgid():
+    raise Error('did not switch to %d' % gid)
+
+def switch_user(uid):
+  'Try to switch to user with uid.'
+  try:
+    os.setuid(uid)
+  except OSError, e:
+    raise Error('could not switch to uid %d (%s)' % (uid, e))
+  if uid != os.getuid():
+    raise Error('did not switch to uid %d' % uid)
+
+def drop_privs(logger, uid, gid):
+  'Drop privileges to uid and gid.'
+  old_uid = os.getuid()
+  old_gid = os.getgid()
+
+  if gid != old_gid:
+    logger.info('switching group to %d', gid)
+    switch_group(gid)
+
+  if uid != old_uid:
+    logger.info('switching user to %d', uid)
+    switch_user(uid)
+
+class Notifier(object):
+  def __init__(self):
+    'Initialize event flags and signal handlers.'
+    self.loop   = True
+    self.hangup = False
+    self.child  = False
+    self.start  = True
+
+    signal.signal(signal.SIGINT,  self.handler)
+    signal.signal(signal.SIGTERM, self.handler)
+    signal.signal(signal.SIGHUP,  self.handler)
+    signal.signal(signal.SIGCHLD, self.handler)
+    signal.signal(signal.SIGUSR1, self.handler)
+    signal.signal(signal.SIGUSR2, self.handler)
+
+  def handler(self, signum, frame):
+    'Handler for signals.'
+    if signum == signal.SIGINT or signum == signal.SIGTERM:
+      self.loop = False
+      return
+
+    if signum == signal.SIGHUP:
+      self.hangup = True
+      return
+
+    if signum == signal.SIGUSR1:
+      self.start = True
+      return
+
+    if signum == signal.SIGUSR2:
+      self.start = False
+      return
+
+    if signum == signal.SIGCHLD:
+      self.child = True
+      return
+
+class Profile(object):
+  def __init__(self, profile_dir, name):
+    self.logger = logging.getLogger(name)
+    self.profile_dir = profile_dir
+    self.name = name
+    self.manage = True
+    self.manage_filename = os.path.join(self.profile_dir, 'manage')
+    self.disabled = 0
+    self.run_file = ''
+    self.pid_file = ''
+    self.pid = None
+    self.stats = {}
+
+    self.scan()
+ 
+  def skip(self):
+    'Return True if we should skip this profile for now.'
+    try:
+      self.check_managed()
+      if not self.manage:
+        return True
+      if not self.disabled:
+        return False
+      if (time.time() < (self.disabled + DISABLE_TIMEFRAME)) and not self.is_modified(self.manage_filename):
+        return True
+      self.enable()
+    except (OSError, IOError), e:
+      self.logger.error('could not check state of profile %s (%s)', self.name, e)
+      return True
+    return False
+
+  def is_modified(self, path):
+    'Test if path has been modified since last request.'
+    st = get_stat(path)
+    if st != self.stats.get(path):
+      self.stats[path] = st
+      return True
+    return False
+
+  def disable(self):
+    'Disable this profile for some time.'
+    self.disabled = time.time()
+    self.check_managed()
+    if self.manage:
+      self.is_modified(self.manage_filename)
+    self.logger.info('disabled profile %s', self.name)
+
+  def enable(self):
+    'Enable this profile.'
+    self.disabled = 0
+    self.logger.info('enabled profile %s', self.name)
+
+  def check_managed(self):
+    'Check state if manage file is present.'
+    if self.is_modified(self.profile_dir):
+      self.manage = os.path.exists(self.manage_filename)
+
+  def scan(self):
+    'Scan profile directory for updates.'
+    if self.skip(): return
+    self.logger.debug('scan profile %s', self.name)
+    self.check_run_file()
+    self.check_pid_conf_file()
+
+  def check_run_file(self):
+    'Check run file.'
+    run_file = os.path.join(self.profile_dir, 'run')
+    if not os.path.exists(run_file):
+      raise Error('missing run file %s' % run_file)
+    if not os.access(run_file, os.X_OK):
+      raise Error('run file %s is not executable' % run_file)
+    self.run_file = run_file
+    
+  def check_pid_conf_file(self):
+    'Check pid file.'
+    pid_conf_file = os.path.join(self.profile_dir, 'pid_file')
+    if not os.path.exists(pid_conf_file):
+      raise Error('missing pid configuration file %s' % pid_conf_file)
+    if self.is_modified(pid_conf_file):
+      self.pid_file = self.read_pid_conf_file(pid_conf_file)
+
+  def read_pid_conf_file(self, pid_conf_file):
+    'Read pid file from pid configuration file.'
+    self.logger.debug('reading pid configuration file %s', pid_conf_file)
+    lines = read_file(pid_conf_file).splitlines()
+    if not lines:
+      raise Error('empty pid configuration file %s' % pid_conf_file)
+    return lines[0]
+
+  def preexec_fn(self):
+    'Drop privileges to owner and group of profile dir.'
+    if 0 in (os.getuid(), os.getgid()):
+      st = os.stat(self.profile_dir)
+      drop_privs(self.logger, st[stat.ST_UID], st[stat.ST_GID])
+
+  def execute(self, cmnd, arg):
+    'Execute command.'
+    # Clean environment
+    environ = {
+               'PATH': '/sbin:/usr/sbin:/usr/local/sbin:/usr/local/bin:/bin:/usr/bin:/usr/X11R6/bin',
+               'LANG': 'POSIX',
+               'TERM': os.environ.get('TERM', 'raw')
+              }
+    exe = os.path.join(self.profile_dir, cmnd)
+    self.logger.info('begin execute command %s %s', exe, arg)
+    child = subprocess.Popen([exe, arg], 
+                             stdout=sys.stdout,
+                             stderr=subprocess.STDOUT,
+                             close_fds=True,
+                             preexec_fn=self.preexec_fn,
+                             env=environ, cwd=os.curdir)
+    start = time.time()
+    timeout = False
+    while True:
+      t = time.time()
+      if t > (start + COMMAND_TIMEOUT):
+        if timeout:
+          if t > (start + COMMAND_TIMEOUT + KILLAFTER):
+            self.logger.error('command "%s %s" did not finish after termination, killing it', exe, arg)
+            child.kill()
+            break
+          # else don't kill yet
+          self.logger.debug('command "%s %s" is terminating', exe, arg)
+        else:
+          self.logger.error('command "%s %s" did not finish in %d seconds, terminating', exe, arg, COMMAND_TIMEOUT)
+          child.terminate()
+          timeout = True
+
+      ret = child.poll()
+      if ret is not None:
+        # child finished
+        self.logger.debug('command "%s %s" finished', exe, arg)
+        break
+      self.logger.debug('command "%s %s" is still running', exe, arg)
+      time.sleep(GRANULARITY)
+
+    self.logger.info('end execute command %s %s', exe, arg)
+
+    if timeout:
+      self.logger.error('command "%s %s" timed out, disabling for %d seconds', exe, arg, DISABLE_TIMEFRAME)
+      self.disable()
+      return
+
+    ret = child.poll()
+    if ret:
+      self.logger.error('command "%s %s" terminated with exit code %d, disabling for %d seconds', exe, arg, ret, DISABLE_TIMEFRAME)
+      self.disable()
+
+  def is_running(self):
+    'Test if profile is running.'
+    pid = self.get_pid()
+
+    if pid is None:
+      # assume it is not
+      return False
+
+    return pid_is_running(pid)
+
+  def get_pid(self):
+    'Try to get pid of profile.'
+    if not os.path.exists(self.pid_file):
+      self.logger.debug('pid file for %s does not exist (%s)', self.name, self.pid_file)
+      return None
+
+    if self.is_modified(self.pid_file):
+      self.logger.debug('reading pid file %s', self.pid_file)
+      self.pid = read_pid_file(self.pid_file)
+
+    return self.pid
+
+  def start(self):
+    'Try to start profile.'
+    self.scan()
+    if self.skip(): return
+    if not self.is_running():
+      self.logger.info('starting profile %s', self.name)
+      self.execute('run', 'start')
+
+  def stop(self):
+    'Try to stop profile.' 
+    self.scan()
+    if self.skip(): return
+    if self.is_running():
+      self.logger.info('stopping profile %s', self.name)
+      self.execute('run', 'stop')
+
+  def disappeared(self):
+    'Profile has disappeared.'
+    if not KILL_WHEN_DISAPPREARED: return
+    self.logger.info('profile %s disappeared, trying to stop process', self.name)
+    if self.pid is not None:
+      if pid_is_running(self.pid):
+        os.kill(self.pid, signal.SIGTERM)
+
+  def __str__(self):
+    return self.name
+
+class ProfileManager(object):
+  def __init__(self, logger, profiles_dir):
+    self.logger = logger
+    self.profiles_dir = profiles_dir
+    self.profiles = {}
+    self.stat = None
+
+    self.scan()
+
+  def is_modified(self):
+    'Test if profile dir has been modified since last request.'
+    try:
+      st = get_stat(self.profiles_dir)
+    except (IOError, OSError), e:
+      raise Error('could not stat profiles directory %s (%s)' % (self.profiles_dir, e))
+
+    if st != self.stat:
+      self.stat = st
+      return True
+    return False
+
+  def scan(self):
+    'Test if profiles were added/removed or modified.'
+    if not self.is_modified():
+      return
+    self.logger.debug('scanning %s', self.profiles_dir)
+    potential = set(os.listdir(self.profiles_dir))
+    current = set(self.profiles)
+
+    for name in sorted((potential - current)):
+      path = os.path.join(self.profiles_dir, name)
+      if os.path.isdir(path):
+        try:
+          self.profiles[name] = Profile(path, name)
+          self.logger.info('adding profile %s', name)
+        except Error, e:
+          self.logger.error('error creating profile %s - %s', name, e)
+          continue
+
+    for name in sorted((current - potential), reverse=True):
+      try:
+          p = self.profiles.pop(name)
+          p.disappeared()
+      except Error, e:
+        self.logger.error('error removing profile %s - %s', name, e)
+        continue
+
+  def start(self):
+    'Try to start profiles.'
+    self.scan()
+
+    for name in sorted(self.profiles):
+      try:
+        self.profiles[name].start()
+      except (Error, IOError, OSError), e:
+        self.profiles[name].disable()
+        self.logger.error('could not start profile %s (%s), disabled for %d seconds', name, e, DISABLE_TIMEFRAME)
+        continue
+
+  def stop(self):
+    'Try to stop profiles.'
+    self.scan()
+
+    for name in sorted(self.profiles, reverse=True):
+      try:
+        self.profiles[name].stop()
+      except (Error, IOError, OSError), e:
+        self.profiles[name].disable()
+        self.logger.error('could not stop profile %s (%s), disabled for %d seconds', name, e, DISABLE_TIMEFRAME)
+        continue
+
+  def __str__(self):
+    return ', '.join((str(n) for n in sorted(self.profiles)))
+
+def main(argv):
+  options, profiles_dir, pid_file = parse_options(argv) 
+  try:
+    if options.log_file:
+      redirect_output(stdout=options.log_file, stderr=options.log_file)
+    logger = make_logger(options)
+    pid_file = os.path.abspath(pid_file)
+    profiles_dir = os.path.abspath(profiles_dir)
+    if not os.path.exists(profiles_dir):
+      raise Error('profiles directory %s does not exist' % profiles_dir)
+
+    logger.debug('options: %s', options)
+    logger.debug('profiles_dir: %s', profiles_dir)
+    logger.debug('pid_file: %s', pid_file)
+
+    if options.daemonize:
+      logger.debug('daemonizing')
+      redirect_input()
+      daemonize()
+
+    n = Notifier()
+    if options.start:
+      if os.path.exists(pid_file):
+        pid = read_pid_file(pid_file)
+        if pid_is_running(pid):
+          os.kill(pid, signal.SIGUSR1)
+          sys.exit(0)
+      n.start = True
+      n.loop = False
+
+    if options.stop:
+      if os.path.exists(pid_file):
+        pid = read_pid_file(pid_file)
+        if pid_is_running(pid):
+          os.kill(pid, signal.SIGUSR2)
+          sys.exit(0)
+      n.start = False
+      n.loop = False
+
+    if options.terminate:
+      if not os.path.exists(pid_file):
+        raise Error('pid file %s does not exist' % pid_file)
+      pid = read_pid_file(pid_file)
+      if not pid_is_running(pid):
+        raise Error('no process running on pid %d' % pid)
+      os.kill(pid, signal.SIGTERM)
+      sys.exit(0)
+
+    if options.hangup:
+      if not os.path.exists(pid_file):
+        raise Error('pid file %s does not exist' % pid_file)
+      pid = read_pid_file(pid_file)
+      if not pid_is_running(pid):
+        raise Error('no process running on pid %d' % pid)
+      os.kill(pid, signal.SIGHUP)
+      sys.exit(0)
+
+    if n.loop:
+      if os.path.exists(pid_file):
+        pid = read_pid_file(pid_file)
+        if pid_is_running(pid):
+          if not options.quiet:
+            raise Error('%s already running on pid %d' % (sys.argv[0], pid))
+          sys.exit(0)
+      write_pid(pid_file)
+      atexit.register(os.unlink, pid_file)
+
+    pmgr = ProfileManager(logger, profiles_dir)
+
+    logger.info('start')
+    while True:
+      if n.start:
+        pmgr.start()
+      else:
+        pmgr.stop()
+      if not n.loop:
+        break
+      if n.hangup and options.log_file:
+        redirect_output(stdout=options.log_file, stderr=options.log_file)
+        n.hangup = False
+      time.sleep(GRANULARITY)
+    logger.info('end')
+  except Error, e:
+    logger.error(e)
+    logger.info('end')
+    sys.exit(2)
+
+if __name__ == '__main__':
+  main(sys.argv)

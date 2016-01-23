@@ -1,0 +1,85 @@
+#!/bin/sh
+#
+# This file is public domain.
+#
+# Author: Ids van der Molen <ids@idsvandermolen.com>
+#
+# chkconfig: 2345 40 20
+# description: (user space) process manager
+#
+### BEGIN INIT INFO
+# Provides: procman
+# Default-Start: 2 3 4 5
+# Default-Stop: 0 1 6
+# Description: (user space) process manager
+### END INIT INFO
+#
+name=procman
+lockfile=/var/lock/subsys/$name
+PROCMAN_PID=/var/run/${name}.pid
+PROCMAN_BIN=/opt/${name}/bin/${name}
+PROCMAN_LOG=/var/log/${name}.log
+PROFILE_DIR=/var/opt/${name}
+test -x $PROCMAN_BIN || { echo "$PROCMAN_BIN not installed";
+        if [ "$1" = "stop" ];then exit 0;
+        else exit 5; fi; }
+
+test -d $PROFILE_DIR || { echo "$PROFILE_DIR not found";
+        if [ "$1" = "stop" ];then exit 0;
+        else exit 5; fi; }
+
+# Source function library.
+. /etc/rc.d/init.d/functions
+
+retval=0
+
+start() {
+    # Start daemons.
+    echo -n "Starting $name: "
+    daemon $PROCMAN_BIN -dqv -l $PROCMAN_LOG $PROFILE_DIR $PROCMAN_PID 
+    retval=$?
+    echo
+    [ $retval -eq 0 ] && touch $lockfile
+    return $retval
+}
+
+stop() {
+    # Stop daemons.
+    echo -n "Shutting down $name: "
+    killproc -p $PROCMAN_PID
+    retval=$?
+    echo
+    [ $retval -eq 0 ] && rm -f $lockfile
+    return $retval
+}
+
+# See how we were called.
+case "$1" in
+  start)
+    start
+        ;;
+  stop)
+    stop
+        ;;
+  status)
+    status -p $PROCMAN_PID
+    retval=$?
+    ;;
+  restart|reload)
+    stop
+    start
+    retval=$?
+    ;;
+  condrestart)
+    if [ -f $lockfile ]; then
+        stop
+        start
+        retval=$?
+    fi
+    ;;
+  *)
+        echo $"Usage: $0 {start|stop|restart|condrestart|status}"
+        exit 1
+esac
+
+exit $retval
