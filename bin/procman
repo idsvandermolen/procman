@@ -332,12 +332,6 @@ class Profile(object):
 
   def execute(self, cmnd, arg):
     'Execute command.'
-    # Clean environment
-    environ = {
-               'PATH': '/sbin:/usr/sbin:/usr/local/sbin:/usr/local/bin:/bin:/usr/bin:/usr/X11R6/bin',
-               'LANG': 'POSIX',
-               'TERM': os.environ.get('TERM', 'raw')
-              }
     exe = os.path.join(self.profile_dir, cmnd)
     self.logger.info('begin execute command %s %s', exe, arg)
     child = subprocess.Popen([exe, arg], 
@@ -345,7 +339,7 @@ class Profile(object):
                              stderr=subprocess.STDOUT,
                              close_fds=True,
                              preexec_fn=self.preexec_fn,
-                             env=environ, cwd=os.curdir)
+                             cwd=os.curdir)
     start = time.time()
     timeout = False
     while True:
